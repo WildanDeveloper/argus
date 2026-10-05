@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -121,6 +122,40 @@ type DNSResolver interface {
 	Lookup(ctx context.Context, name, rrType string) ([]DNSRecord, error)
 }
 
+// Dialer opens a TCP connection through the broker.
+//
+// It exists because a collector must not be able to reach the network except
+// through the same controls the HTTP path gets: the SSRF check at dial time, the
+// rate limiter, the circuit breaker, the scope guard, and the audit log. WHOIS needs
+// port 43 and a module holding its own net.Dialer would be the one component in the
+// process with no such controls on it.
+//
+// The connection is deliberately text-oriented. Every protocol that needs raw TCP in
+// this build is line-based, and exposing byte streams would mean every module
+// reimplementing its own read deadlines and size bounds.
+type Dialer interface {
+	// DialText connects, optionally sends a query line, and returns a reader over the
+	// response. Closing it releases the connection.
+	DialText(ctx context.Context, address string, q DialQuery) (TextConn, error)
+}
+
+// DialQuery describes one line-oriented exchange.
+type DialQuery struct {
+	// Query is written immediately after the connection is established, with CRLF
+	// appended. An empty Query reads without writing, for servers that greet first.
+	Query string
+	// MaxBytes bounds the response. Zero means the broker default.
+	MaxBytes int64
+	// Timeout bounds the whole exchange. Zero means the broker default.
+	Timeout time.Duration
+}
+
+// TextConn is a brokered connection being read.
+type TextConn interface {
+	io.Reader
+	Close() error
+}
+
 // Cache is a layered cache. Get returns false on miss. Implementations coalesce
 // concurrent identical requests.
 type Cache interface {
@@ -154,8 +189,12 @@ type EvidenceMeta struct {
 // Deps is the only way a module reaches the outside world. Everything here is
 // brokered and audited.
 type Deps struct {
-	HTTP    HTTPDoer
-	DNS     DNSResolver
+	HTTP HTTPDoer
+	DNS  DNSResolver
+	// Dial opens brokered TCP connections. Nil for modules that do not need one, and
+	// a module that needs it must fail Init rather than fall back to net.Dial, which
+	// would be the only unmediated egress in the process.
+	Dial    Dialer
 	Cache   Cache
 	Secrets SecretReader
 	Blobs   BlobWriter
