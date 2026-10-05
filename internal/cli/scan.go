@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -517,9 +518,27 @@ func buildDeps(cfg *config.Config, guard *policy.Guard, pol *policy.Policy, f sc
 		}
 		resolver := egress.NewDoHResolver(client, cfg.Network.DNS.Consensus)
 
+		// The TCP broker is built per module too, so its rate limit and audit entries
+		// name the module that opened the connection.
+		tcp, err := egress.NewTCPDialer(egress.TCPConfig{
+			Module: man.Name,
+			// The TCP guard mirrors the HTTP client's, so a port 43 connection is
+			// held to exactly the same address rules as an HTTP one.
+			Guard:   tcpGuard(cfg),
+			Limits:  egress.NewRateLimiter(globalRate, cfg.RateLimit.Burst, perHost, withModuleHint(perModule, man)),
+			Breaker: breaker,
+			Scope:   scopeCheck,
+			Timeout: f.timeout,
+			Logger:  deps.Logger,
+		})
+		if err != nil {
+			return sdk.Deps{}, err
+		}
+
 		d := sdk.Deps{
 			HTTP:    client,
 			DNS:     resolver,
+			Dial:    tcp,
 			Secrets: scopedSecrets{reader: secretReader, allowed: man.SecretNames()},
 			Blobs:   newBlobWriter(evidenceStore),
 			InScope: inScopeHelper{guard: guard}.InScope,
@@ -573,6 +592,34 @@ func moduleConfig(cfg *config.Config, name string) map[string]any {
 }
 
 // guardAdapter bridges policy.Guard to the broker's ScopeChecker.
+// tcpGuard builds the address guard for the TCP broker from the same configuration the
+// HTTP broker uses, so a port 43 connection is held to identical address rules.
+func tcpGuard(cfg *config.Config) *egress.SSRFGuard {
+	g := &egress.SSRFGuard{AllowPrivate: !cfg.Network.Egress.BlockPrivate}
+	for _, raw := range cfg.Network.Egress.AllowPrivateCIDRs {
+		if p, err := netip.ParsePrefix(strings.TrimSpace(raw)); err == nil {
+			g.AllowPrivateCIDRs = append(g.AllowPrivateCIDRs, p)
+		}
+	}
+	return g
+}
+
+// CheckDial applies the same scope rules to a TCP connection as to a URL. A WHOIS
+// server is a third-party host reached outside the subject's infrastructure, so it is
+// held to the module's declared reach just as an HTTP host is.
+func (a *guardAdapter) CheckDial(_ context.Context, host string, port int, module string) error {
+	// Resolved from the compile-time registry, exactly as the URL path does, so a host
+	// permitted for an HTTP request is permitted for the same reason on a TCP one.
+	man, ok := sdk.New(module)
+	if !ok {
+		return fmt.Errorf("unknown module %q", module)
+	}
+	if !man.Manifest().AllowsHost(host) {
+		return fmt.Errorf("module %s does not declare %s in its EgressHosts allow-list", module, host)
+	}
+	return nil
+}
+
 type guardAdapter struct {
 	guard  *policy.Guard
 	policy *policy.Engine
