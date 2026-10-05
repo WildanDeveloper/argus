@@ -399,11 +399,14 @@ var _ sdk.Emitter = (*Capture)(nil)
 
 // Harness wraps a module with fake dependencies and assertions.
 type Harness struct {
-	T       *testing.T
-	Module  sdk.Module
-	Clock   *FakeClock
-	DNS     *FakeDNS
-	HTTP    *Recorder
+	T      *testing.T
+	Module sdk.Module
+	Clock  *FakeClock
+	DNS    *FakeDNS
+	HTTP   *Recorder
+	// Dial is the scripted TCP dialer. It is set on the harness by default so a module
+	// needing port 43 fails loudly on an unscripted server instead of silently.
+	Dial    *FakeDialer
 	Cache   *FakeCache
 	Secrets *FakeSecrets
 	Blobs   *Blobs
@@ -428,6 +431,7 @@ func NewHarness(t *testing.T, m sdk.Module, opts ...func(*Harness)) *Harness {
 		Cache:  NewFakeCache(),
 		Blobs:  NewBlobs(),
 		Out:    &Capture{},
+		Dial:   NewFakeDialer(),
 	}
 	// The emitter forwards artifact writes into the harness blob store, so a test
 	// can assert what a module retained without wiring a real evidence backend.
@@ -437,6 +441,7 @@ func NewHarness(t *testing.T, m sdk.Module, opts ...func(*Harness)) *Harness {
 	h.deps = sdk.Deps{
 		HTTP:    h.HTTP,
 		DNS:     h.DNS,
+		Dial:    h.Dial,
 		Cache:   h.Cache,
 		Blobs:   h.Blobs,
 		Secrets: h.Secrets,
@@ -748,3 +753,74 @@ func ParseURL(raw string) *url.URL {
 	}
 	return u
 }
+
+// FakeDialer is a scripted sdk.Dialer.
+//
+// It exists because a module that needs a raw TCP connection must still be testable
+// without opening one. A collector reaching port 43 was previously untestable, which is
+// the kind of gap that shows up as a module nobody trusts.
+type FakeDialer struct {
+	mu      sync.Mutex
+	replies map[string]string // "host:port"
+	errs    map[string]error
+	calls   []string
+	// Blobs receives the retained exchange, so a test can assert what was sent.
+	Sent []string
+}
+
+var _ sdk.Dialer = (*FakeDialer)(nil)
+
+// NewFakeDialer returns an empty scripted dialer.
+func NewFakeDialer() *FakeDialer {
+	return &FakeDialer{replies: map[string]string{}, errs: map[string]error{}}
+}
+
+// Reply scripts the answer for a host:port.
+func (f *FakeDialer) Reply(address, body string) *FakeDialer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replies[strings.ToLower(address)] = body
+	return f
+}
+
+// ReplyErr scripts a connection failure for a host:port.
+func (f *FakeDialer) ReplyErr(address string, err error) *FakeDialer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs[strings.ToLower(address)] = err
+	return f
+}
+
+// DialText returns the scripted answer.
+func (f *FakeDialer) DialText(_ context.Context, address string, q sdk.DialQuery) (sdk.TextConn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := strings.ToLower(address)
+	f.calls = append(f.calls, key+" "+q.Query)
+	f.Sent = append(f.Sent, q.Query)
+	if err, ok := f.errs[key]; ok {
+		return nil, err
+	}
+	body, ok := f.replies[key]
+	if !ok {
+		return nil, fmt.Errorf("sdktest: no scripted reply for %s", address)
+	}
+	if q.MaxBytes > 0 && int64(len(body)) > q.MaxBytes {
+		body = body[:q.MaxBytes]
+	}
+	return &fakeTextConn{Reader: strings.NewReader(body), body: body}, nil
+}
+
+// Calls returns the exchanges performed, in order.
+func (f *FakeDialer) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+type fakeTextConn struct {
+	io.Reader
+	body string
+}
+
+func (c *fakeTextConn) Close() error { return nil }

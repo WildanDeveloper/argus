@@ -528,7 +528,10 @@ func buildDeps(cfg *config.Config, guard *policy.Guard, pol *policy.Policy, f sc
 			Limits:  egress.NewRateLimiter(globalRate, cfg.RateLimit.Burst, perHost, withModuleHint(perModule, man)),
 			Breaker: breaker,
 			Scope:   scopeCheck,
-			Timeout: f.timeout,
+			// The per-exchange TCP timeout, not the scan timeout. A task that follows a
+			// WHOIS referral opens more than one connection, and giving each the whole
+			// task budget means the task can never complete.
+			Timeout: cfg.Network.TCP.Timeout.Duration(),
 			Logger:  deps.Logger,
 		})
 		if err != nil {

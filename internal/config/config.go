@@ -62,6 +62,13 @@ type Config struct {
 			HTTP3         bool   `yaml:"http3"`
 			TLSMinVersion string `yaml:"tls_min_version"`
 		} `yaml:"http"`
+		TCP struct {
+			// Timeout bounds one TCP exchange, not a whole task. It is separate from the
+			// scan timeout because a task that retries a WHOIS referral will open more
+			// than one connection, and giving each of them the entire task budget means
+			// the task can never finish.
+			Timeout Duration `yaml:"timeout"`
+		} `yaml:"tcp"`
 		DNS struct {
 			Resolvers []string `yaml:"resolvers"`
 			Transport string   `yaml:"transport"`
@@ -320,6 +327,11 @@ func Defaults() *Config {
 	c.Network.UserAgent = defaultUserAgent()
 	c.Network.HonestUA = true
 	c.Network.HTTP.MaxBodyBytes = 8 << 20
+	// Short by default: a WHOIS task that follows a referral opens two connections, and a
+	// per-exchange budget long enough to outlive the task deadline turns an unreachable
+	// server into an unhelpful "task timed out" instead of the connect error that says
+	// what actually happened.
+	c.Network.TCP.Timeout = Duration(5 * time.Second)
 	c.Network.HTTP.MaxRedirects = 5
 	c.Network.HTTP.HTTP3 = false
 	c.Network.HTTP.TLSMinVersion = "1.2"
@@ -608,6 +620,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Network.HTTP.MaxBodyBytes <= 0 {
 		return fmt.Errorf("config: network.http.max_body_bytes must be positive; a zero limit would disable response bounds")
+	}
+	if c.Network.TCP.Timeout <= 0 {
+		return fmt.Errorf("config: network.tcp.timeout must be positive; a zero limit would let a TCP connection hang for the whole task budget")
 	}
 	if c.Network.Retry.MaxAttempts < 1 {
 		return fmt.Errorf("config: network.retry.max_attempts must be at least 1")
