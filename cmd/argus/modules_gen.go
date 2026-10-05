@@ -3,6 +3,7 @@
 package main
 
 import (
+	_ "github.com/WildanDeveloper/argus/modules/domain/ctsearch"
 	_ "github.com/WildanDeveloper/argus/modules/domain/dnsrecords"
 	_ "github.com/WildanDeveloper/argus/modules/domain/rdap"
 )
