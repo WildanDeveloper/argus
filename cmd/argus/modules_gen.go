@@ -8,4 +8,5 @@ import (
 	_ "github.com/WildanDeveloper/argus/modules/domain/rdap"
 	_ "github.com/WildanDeveloper/argus/modules/domain/wayback"
 	_ "github.com/WildanDeveloper/argus/modules/network/asnlookup"
+	_ "github.com/WildanDeveloper/argus/modules/network/ipgeo"
 )
