@@ -69,6 +69,14 @@ type ClientConfig struct {
 	DisableCache      bool
 	Cookies           bool
 	Logger            *slog.Logger
+	// BootstrapHosts are URLs whose responses may authorize additional egress hosts
+	// for this client. Deriving the grant in the broker is what keeps least
+	// privilege intact: a module asks for a URL it may already reach and never
+	// asserts a host for itself.
+	BootstrapHosts []string
+	// Grant receives hosts derived from bootstrap documents. A nil Grant disables
+	// the mechanism entirely.
+	Grant *BootstrapGrant
 }
 
 // Client is the broker. It satisfies sdk.HTTPDoer.
@@ -78,6 +86,7 @@ type Client struct {
 	limits  *RateLimiter
 	breaker *Breaker
 	retry   *Retryer
+	grants  *BootstrapGrant
 	cache   Cache
 	audit   Auditor
 
@@ -186,6 +195,7 @@ func NewClient(cfg ClientConfig, guard *SSRFGuard, limits *RateLimiter, breaker 
 
 	c := &Client{
 		cfg:        cfg,
+		grants:     cfg.Grant,
 		guard:      g,
 		limits:     limits,
 		breaker:    breaker,
@@ -478,6 +488,17 @@ func (c *Client) roundTrip(ctx context.Context, req *http.Request, host string) 
 		return nil, &RetryableError{Err: readErr}
 	}
 
+	// A bootstrap response may authorize further hosts for this module. Deriving the
+	// grant here, in the broker, is what keeps the boundary: the module never says
+	// which hosts it wants, it only asks for a URL it was already permitted to reach.
+	if c.isBootstrap(req.URL.String()) {
+		added := c.grants.Absorb(c.cfg.Module, body)
+		if len(added) > 0 {
+			c.cfg.Logger.Debug("bootstrap granted additional egress hosts",
+				"module", c.cfg.Module, "hosts", len(added))
+		}
+	}
+
 	// Store for the cache before handing the body to the caller.
 	if c.cache != nil && !c.cfg.DisableCache && resp.StatusCode == http.StatusOK {
 		c.cache.Put(cacheKey(req), &CachedResponse{
@@ -537,6 +558,57 @@ func (c *Client) readBounded(resp *http.Response) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// isBootstrap reports whether a request went to one of this module's declared
+// bootstrap URLs.
+//
+// Both host and path are compared. Matching the host alone would let any JSON served
+// from the bootstrap host's address hand the module a grant, and a registry host
+// serves plenty of paths that are not the bootstrap. Matching the port matters for
+// the same reason: a different service on the same address is not the bootstrap.
+func (c *Client) isBootstrap(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	path := u.Path
+
+	for _, b := range c.cfg.BootstrapHosts {
+		bu, err := url.Parse(b)
+		if err != nil || bu.Host == "" {
+			continue
+		}
+		if strings.ToLower(bu.Host) != host {
+			continue
+		}
+		// A declaration with no path authorizes the whole host, which is a
+		// deliberate and broader grant the operator has to write on purpose.
+		declared := strings.TrimSuffix(bu.Path, "/")
+		if declared == "" {
+			return true
+		}
+		if path == declared || strings.HasPrefix(path, declared+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// hostPortOf extracts the host[:port] of a URL, keeping the port.
+func hostPortOf(raw string) string {
+	s := strings.TrimSpace(raw)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.ToLower(s)
+}
+
+// Grants returns the bootstrap-derived allow-list for this client.
+func (c *Client) Grants() *BootstrapGrant { return c.grants }
 
 // checkScope asks the scope guard whether this module may reach this URL.
 func (c *Client) checkScope(ctx context.Context, u *url.URL) error {

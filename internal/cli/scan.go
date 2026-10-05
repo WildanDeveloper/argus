@@ -471,7 +471,10 @@ func buildDeps(cfg *config.Config, guard *policy.Guard, pol *policy.Policy, f sc
 
 	// scopeCheck adapts the guard to the broker's narrow interface, keeping the
 	// dependency one-way: egress must not import policy.
-	scopeCheck := &guardAdapter{guard: guard, policy: policyEngine}
+	// The grant table is shared across modules: each entry is keyed by module name,
+	// so one collector's bootstrap never widens another's reach.
+	grants := egress.NewBootstrapGrant()
+	scopeCheck := &guardAdapter{guard: guard, policy: policyEngine, grants: grants}
 
 	evidenceStore, err := engine.NewEvidenceStore(st, cfg.Storage.Blobs.Path, nil)
 	if err != nil {
@@ -502,6 +505,10 @@ func buildDeps(cfg *config.Config, guard *policy.Guard, pol *policy.Policy, f sc
 			Timeout:           f.timeout,
 			DisableCache:      f.noCache || f.refresh,
 			Logger:            deps.Logger,
+			// The broker derives additional reachable hosts from whatever these
+			// bootstrap documents return. The module never asserts a host itself.
+			BootstrapHosts: man.BootstrapHosts,
+			Grant:          grants,
 		}, nil,
 			egress.NewRateLimiter(globalRate, cfg.RateLimit.Burst, perHost, withModuleHint(perModule, man)),
 			breaker, retry, brokerCache(memoryCache), nil, scopeCheck)
@@ -569,6 +576,8 @@ func moduleConfig(cfg *config.Config, name string) map[string]any {
 type guardAdapter struct {
 	guard  *policy.Guard
 	policy *policy.Engine
+	// grants holds hosts a module's own bootstrap document authorized.
+	grants *egress.BootstrapGrant
 }
 
 // CheckEgress decides whether a module may reach a URL.
@@ -593,8 +602,12 @@ func (a *guardAdapter) CheckEgress(_ context.Context, u *url.URL, module string)
 		return fmt.Errorf("unknown module %q", module)
 	}
 	mm := man.Manifest()
-	if !mm.AllowsHost(u.Hostname()) {
-		return fmt.Errorf("module %s does not declare %s in its EgressHosts allow-list", module, u.Hostname())
+	host := u.Hostname()
+	if !mm.AllowsHost(host) && !a.grants.Allows(module, host) {
+		// A host reached without a declaration and without a bootstrap grant is a
+		// collector trying to exceed its declared reach. Refusing here is what makes
+		// the manifest mean something.
+		return fmt.Errorf("module %s may not reach %s: it is neither in EgressHosts nor granted by a bootstrap document", module, host)
 	}
 	if a.guard != nil && a.policy != nil {
 		// An active-mode module must additionally hold an authorization that

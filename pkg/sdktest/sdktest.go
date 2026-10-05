@@ -335,13 +335,19 @@ func (b *Blobs) Bytes() []byte {
 	return out
 }
 
-// Capture is a recording sdk.Emitter.
+// Capture is a recording sdk.Emitter that forwards artifact writes to the
+// harness's Blobs, so a test can assert what a module actually retained.
 type Capture struct {
 	mu       sync.Mutex
 	Findings []sdk.Finding
 	Warnings []string
 	// Steps records (done, total) progress reports.
 	Steps [][2]int
+	// Blobs receives PutEvidence calls. Nil means evidence is discarded.
+	Blobs *Blobs
+	// Evidence records the refs handed back, so a test can check linkage without
+	// inspecting the blob store.
+	Evidence []sdk.EvidenceRef
 }
 
 // Emit records a finding.
@@ -352,12 +358,27 @@ func (c *Capture) Emit(f sdk.Finding) error {
 	return nil
 }
 
-// PutEvidence is a no-op: the harness Blobs is used directly by modules that
-// declare one.
-func (c *Capture) PutEvidence(_ context.Context, _ sdk.EvidenceMeta, raw []byte) (sdk.EvidenceRef, error) {
+// PutEvidence records the artifact through the harness blob store.
+func (c *Capture) PutEvidence(ctx context.Context, meta sdk.EvidenceMeta, raw []byte) (sdk.EvidenceRef, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return sdk.EvidenceRef{ID: "captured"}, nil
+	blobs := c.Blobs
+	c.mu.Unlock()
+
+	var ref sdk.EvidenceRef
+	if blobs != nil {
+		r, err := blobs.Put(ctx, meta, raw)
+		if err != nil {
+			return sdk.EvidenceRef{}, err
+		}
+		ref = r
+	} else {
+		ref = sdk.EvidenceRef{ID: "captured"}
+	}
+
+	c.mu.Lock()
+	c.Evidence = append(c.Evidence, ref)
+	c.mu.Unlock()
+	return ref, nil
 }
 
 // Progress records a progress report.
@@ -408,6 +429,9 @@ func NewHarness(t *testing.T, m sdk.Module, opts ...func(*Harness)) *Harness {
 		Blobs:  NewBlobs(),
 		Out:    &Capture{},
 	}
+	// The emitter forwards artifact writes into the harness blob store, so a test
+	// can assert what a module retained without wiring a real evidence backend.
+	h.Out.Blobs = h.Blobs
 	man := m.Manifest()
 	h.Secrets = NewFakeSecrets(man.SecretNames(), map[string]string{})
 	h.deps = sdk.Deps{

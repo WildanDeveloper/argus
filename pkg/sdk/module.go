@@ -40,10 +40,22 @@ type Manifest struct {
 	Mode        Mode
 	Sensitivity Sensitivity
 	Secrets     []SecretSpec
-	EgressHosts []string        // enforced allow-list for this module
-	RateHints   map[string]Rate // host -> suggested rate
-	CostPerCall float64         // USD estimate; 0 if free
-	Tags        []string
+	// EgressHosts is the enforced allow-list for this module. A module may reach a
+	// host only if it appears here or was granted from a bootstrap document.
+	EgressHosts []string
+	// BootstrapHosts names URLs the broker may fetch in order to authorize further
+	// hosts. A module that must discover its endpoints cannot enumerate them in a
+	// static list without going stale, and simply trusting it to reach whatever it
+	// likes would remove the boundary entirely.
+	//
+	// The grant is derived by the broker from the document it fetched, never asserted
+	// by the module: a collector would have to forge the response of a host it was
+	// already allowed to contact. The trust this places in a bootstrap host is the
+	// whole content of the grant, so only declare a bootstrap you trust.
+	BootstrapHosts []string
+	RateHints      map[string]Rate // host -> suggested rate
+	CostPerCall    float64         // USD estimate; 0 if free
+	Tags           []string
 }
 
 // SecretNames lists declared secret names.
