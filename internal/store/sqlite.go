@@ -853,6 +853,67 @@ func (s *SQLite) Evidence(ctx context.Context, id string) (Evidence, error) {
 	return e, nil
 }
 
+// EvidenceForCase returns a case's evidence records in chain order.
+func (s *SQLite) EvidenceForCase(ctx context.Context, caseID string, limit int) ([]Evidence, error) {
+	if limit <= 0 {
+		limit = 10000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, case_id, scan_id, sha256, size, media_type, source, method, collector,
+		       captured_at, prev_hash, record_hash, blob_path
+		FROM evidence WHERE case_id = ? ORDER BY captured_at, id`, caseID, limit)
+	if err != nil {
+		return nil, describeErr("EvidenceForCase", err)
+	}
+	defer rows.Close()
+
+	var out []Evidence
+	for rows.Next() {
+		var e Evidence
+		var c, sc, mt, src, method, collector, blob, captured, prev sql.NullString
+		if err := rows.Scan(&e.ID, &c, &sc, &e.SHA256, &e.Size, &mt, &src, &method, &collector,
+			&captured, &prev, &e.RecordHash, &blob); err != nil {
+			return nil, describeErr("EvidenceForCase scan", err)
+		}
+		e.CaseID, e.ScanID = c.String, sc.String
+		e.MediaType, e.Source, e.Method, e.Collector, e.BlobPath = mt.String, src.String, method.String, collector.String, blob.String
+		e.CapturedAt = parseTS(captured.String)
+		e.PrevHash = prev.String
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// EvidenceChainHead returns the most recent record hash for a case.
+func (s *SQLite) EvidenceChainHead(ctx context.Context, caseID string) (string, error) {
+	var head sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT record_hash FROM evidence WHERE case_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1`,
+		caseID).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", describeErr("EvidenceChainHead", err)
+	}
+	return head.String, nil
+}
+
+// DeleteEvidence removes the record at a zero-based position within a case.
+func (s *SQLite) DeleteEvidence(ctx context.Context, caseID string, position int) error {
+	recs, err := s.EvidenceForCase(ctx, caseID, 0)
+	if err != nil {
+		return err
+	}
+	if position < 0 || position >= len(recs) {
+		return fmt.Errorf("%w: evidence position %d", ErrNotFound, position)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.db.ExecContext(ctx, `DELETE FROM evidence WHERE id = ?`, recs[position].ID)
+	return err
+}
+
 // Stats reports store counters.
 func (s *SQLite) Stats(ctx context.Context) (StoreStats, error) {
 	var st StoreStats

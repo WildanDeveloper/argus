@@ -27,11 +27,19 @@ type emitter struct {
 	task      sdk.Task
 	ctx       context.Context
 
-	mu      sync.Mutex
-	batch   store.Batch
-	pending []sdk.Finding
-	done    chan struct{}
-	closed  bool
+	mu       sync.Mutex
+	batch    store.Batch
+	pending  []sdk.Finding
+	evidence []sdk.EvidenceRef
+	done     chan struct{}
+	closed   bool
+}
+
+func appendRef(refs []sdk.EvidenceRef, r sdk.EvidenceRef) []sdk.EvidenceRef {
+	if containsRef(refs, r) {
+		return refs
+	}
+	return append(refs, r)
 }
 
 // Emit reports one finding.
@@ -45,6 +53,13 @@ func (e *emitter) Emit(f sdk.Finding) error {
 		e.warn("emitted finding with no entity id")
 		return nil
 	}
+
+	// Snapshot the evidence captured for this task before taking the write lock.
+	// Reading it under the same lock used for the batch would require unlocking in
+	// the middle of the append, which is where a deadlock creeps in.
+	e.mu.Lock()
+	evidence := append([]sdk.EvidenceRef(nil), e.evidence...)
+	e.mu.Unlock()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -70,6 +85,12 @@ func (e *emitter) Emit(f sdk.Finding) error {
 	if f.Observation.Subject == "" {
 		f.Observation.Subject = f.Entity.ID
 	}
+	// Attach any evidence this task captured. This is the mechanism behind the
+	// evidence-first rule: an observation with a retrievable artifact may exceed the
+	// unverified cap, and one without may not.
+	for _, ref := range evidence {
+		f.Observation.Evidence = appendRef(f.Observation.Evidence, ref)
+	}
 	// Derive the observation's identity here rather than requiring each module to
 	// do it: an observation with no ID is skipped by the store, and the finding
 	// then exists with no provenance at all.
@@ -94,12 +115,17 @@ func (e *emitter) Emit(f sdk.Finding) error {
 	return nil
 }
 
-// PutEvidence stores an artifact and attaches the reference to later findings.
+// PutEvidence stores an artifact for the current task.
+//
+// The reference is remembered and attached to every finding this task emits, which
+// is what promotes those findings above the unverified cap. A module that stores
+// evidence but never links it would leave its own observations looking unsupported,
+// so the link is made here rather than left to the module to remember.
 func (e *emitter) PutEvidence(ctx context.Context, meta sdk.EvidenceMeta, raw []byte) (sdk.EvidenceRef, error) {
 	if err := e.ctx.Err(); err != nil {
 		return sdk.EvidenceRef{}, err
 	}
-	if e.orch.deps.Store == nil {
+	if e.orch.deps.EvidenceStore == nil {
 		return sdk.EvidenceRef{}, fmt.Errorf("engine: no evidence store configured")
 	}
 	if meta.CapturedAt.IsZero() {
@@ -109,11 +135,27 @@ func (e *emitter) PutEvidence(ctx context.Context, meta sdk.EvidenceMeta, raw []
 		meta.Collector = e.module.Name + "@" + e.module.Version
 	}
 
-	rec, err := e.orch.Store(ctx, e.orch.scanID(), e.task.CaseID, meta, raw)
+	ref, err := e.orch.Store(ctx, e.orch.scanID(), e.task.CaseID, meta, raw)
 	if err != nil {
 		return sdk.EvidenceRef{}, err
 	}
-	return rec, nil
+
+	e.mu.Lock()
+	if !containsRef(e.evidence, ref) {
+		e.evidence = append(e.evidence, ref)
+	}
+	e.mu.Unlock()
+
+	return ref, nil
+}
+
+func containsRef(refs []sdk.EvidenceRef, r sdk.EvidenceRef) bool {
+	for _, x := range refs {
+		if x.ID == r.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // Progress reports completion counters. It is advisory and never blocks.
@@ -330,38 +372,4 @@ func (o *Orchestrator) Store(ctx context.Context, scanID, caseID string, meta sd
 		return sdk.EvidenceRef{}, fmt.Errorf("engine: no evidence store configured")
 	}
 	return o.deps.EvidenceStore.Store(ctx, scanID, caseID, meta, raw)
-}
-
-// EvidenceStore is the content-addressed artifact store.
-type EvidenceStore struct {
-	store store.Store
-	dir   string
-	now   func() time.Time
-	log   *slog.Logger
-}
-
-// NewEvidenceStore builds an artifact store rooted at dir.
-func NewEvidenceStore(s store.Store, dir string, log *slog.Logger) (*EvidenceStore, error) {
-	return &EvidenceStore{store: s, dir: dir, now: time.Now, log: log}, nil
-}
-
-// Store writes an artifact and its record.
-func (es *EvidenceStore) Store(ctx context.Context, scanID, caseID string, meta sdk.EvidenceMeta, raw []byte) (sdk.EvidenceRef, error) {
-	sum := sha256Hex(raw)
-	// Content addressing: the path is derived from the digest, so a modified
-	// artifact cannot occupy the same location as the original.
-	rel := fmt.Sprintf("%s/%s/%s", sum[:2], sum[2:4], sum)
-	path := es.dir + string(osPathSeparator) + rel
-	if err := mkdirAll(es.dir); err != nil {
-		return sdk.EvidenceRef{}, err
-	}
-	if err := writeFileAtomic(path, raw); err != nil {
-		return sdk.EvidenceRef{}, err
-	}
-	return es.store.PutEvidence(ctx, store.Evidence{
-		CaseID: caseID, ScanID: scanID, SHA256: sum, Size: int64(len(raw)),
-		MediaType: meta.MediaType, Source: meta.Source, Method: meta.Method,
-		Collector: meta.Collector, CapturedAt: meta.CapturedAt, BlobPath: rel,
-		RecordHash: chainRecordHash(scanID, sum, meta),
-	})
 }

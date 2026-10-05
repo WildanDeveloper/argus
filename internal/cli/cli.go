@@ -52,6 +52,8 @@ func Run(args []string, stdout, stderr io.Writer) (int, error) {
 		return runConfig(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
+	case "evidence":
+		return runEvidence(rest, stdout, stderr)
 	case "doctor":
 		return runDoctor(rest, stdout, stderr)
 	}

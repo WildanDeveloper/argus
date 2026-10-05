@@ -61,6 +61,16 @@ type Store interface {
 	PutEvidence(ctx context.Context, e Evidence) (sdk.EvidenceRef, error)
 	// Evidence returns an evidence record by ID.
 	Evidence(ctx context.Context, id string) (Evidence, error)
+	// EvidenceForCase returns a case's evidence records in capture order, which is
+	// the order the hash chain was built in.
+	EvidenceForCase(ctx context.Context, caseID string, limit int) ([]Evidence, error)
+	// EvidenceChainHead returns the last record hash for a case, or an empty string
+	// when the case has no evidence yet. A restarted process must recover this or it
+	// will start a second chain and every subsequent verification will fail.
+	EvidenceChainHead(ctx context.Context, caseID string) (string, error)
+	// DeleteEvidence removes a record by ordinal position within a case. It exists
+	// for tests that must simulate tampering; normal erasure goes through Purge.
+	DeleteEvidence(ctx context.Context, caseID string, position int) error
 
 	// Diff compares two scans and reports added, removed, and changed entities.
 	Diff(ctx context.Context, fromScan, toScan string) (DiffResult, error)

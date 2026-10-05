@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -674,3 +676,9 @@ func (b blobWriter) Put(ctx context.Context, meta sdk.EvidenceMeta, raw []byte) 
 }
 
 func newBlobWriter(es *engine.EvidenceStore) sdk.BlobWriter { return blobWriter{es} }
+
+// sha256Hex hashes bytes for content verification.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}

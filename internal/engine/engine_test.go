@@ -72,18 +72,28 @@ func newHarness(t *testing.T, mods ...sdk.Module) (*Orchestrator, store.Store, *
 	}
 
 	opts := DefaultOptions()
+	// Bind a case so the evidence chain and the case-scoped reads below have
+	// something to bind to; an unbound case stores NULL and cannot be queried back.
+	opts.CaseID = testCaseID
 	opts.MaxDepth = 0
 	opts.Workers = 4
 	opts.TaskTimeout = 5 * time.Second
 	opts.ScanTimeout = 30 * time.Second
 	opts.Mode = sdk.ModeSemiActive
 
-	pipeCfg := pipeline.DefaultConfig()
+	// A real content-addressed store, so the evidence path under test is the same
+	// one a scan uses rather than a stub.
+	evStore, err := NewEvidenceStore(st, t.TempDir(),
+		slog.New(slog.NewTextHandler(discard{}, &slog.HandlerOptions{Level: slog.LevelError})))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	o, err := New(opts, Dependencies{
 		Store: st, Audit: auditLog, Engine: pe, Guard: guard, Modules: mods,
-		Logger: slog.New(slog.NewTextHandler(discard{}, &slog.HandlerOptions{Level: slog.LevelError})),
-		Now:    time.Now,
+		EvidenceStore: evStore,
+		Logger:        slog.New(slog.NewTextHandler(discard{}, &slog.HandlerOptions{Level: slog.LevelError})),
+		Now:           time.Now,
 		DepsFor: func(man sdk.Manifest) (sdk.Deps, error) {
 			return sdk.Deps{
 				Log:    slog.New(slog.NewTextHandler(discard{}, &slog.HandlerOptions{Level: slog.LevelError})),
@@ -91,13 +101,16 @@ func newHarness(t *testing.T, mods ...sdk.Module) (*Orchestrator, store.Store, *
 				Config: map[string]any{},
 			}, nil
 		},
-		PipelineConfig: pipeCfg,
+		PipelineConfig: pipeline.DefaultConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return o, st, auditLog
 }
+
+// testCaseID is the case every harness test binds to.
+const testCaseID = "test-case"
 
 type discard struct{}
 
@@ -462,5 +475,117 @@ func TestResolveTarget(t *testing.T) {
 	}
 	if _, err := ResolveTarget("not a target at all"); err == nil {
 		t.Error("garbage must be rejected")
+	}
+}
+
+// evidenceModule stores an artifact and then emits a finding derived from it.
+type evidenceModule struct {
+	manifest sdk.Manifest
+	keep     bool
+}
+
+func (m *evidenceModule) Manifest() sdk.Manifest               { return m.manifest }
+func (m *evidenceModule) Init(context.Context, sdk.Deps) error { return nil }
+func (m *evidenceModule) Close() error                         { return nil }
+
+func (m *evidenceModule) Run(ctx context.Context, task sdk.Task, e sdk.Emitter) error {
+	if m.keep {
+		if _, err := e.PutEvidence(ctx, sdk.EvidenceMeta{
+			Source: "fixture://answer", Method: "test.lookup", MediaType: "application/json",
+		}, []byte(`{"answer":"203.0.113.10"}`)); err != nil {
+			return err
+		}
+	}
+	ip := sdk.NewEntity(sdk.TypeIP, "203.0.113.10")
+	return e.Emit(sdk.Finding{
+		Entity:    ip,
+		Relations: []sdk.Relation{sdk.Rel(task.Target.ID, ip.ID, sdk.RelResolvesTo)},
+		Observation: sdk.Observation{
+			Predicate:   "resolves_to",
+			Object:      task.Target.ID,
+			Source:      sdk.Source{Module: m.manifest.Name, Provider: "fixture", Method: "test.lookup"},
+			Reliability: 'A',
+			Credibility: '1',
+		},
+	})
+}
+
+func evidenceManifest(name string) sdk.Manifest {
+	return sdk.Manifest{
+		Name: name, Version: "1.0.0", Category: "domain",
+		Consumes: []sdk.EntityType{sdk.TypeDomain},
+		Produces: []sdk.EntityType{sdk.TypeIP},
+		Mode:     sdk.ModeSemiActive,
+		// An authoritative grade with an artifact should score far above the
+		// unverified cap; the same grade without one must stay capped.
+		EgressHosts: []string{"fixture.example"},
+	}
+}
+
+func TestEvidenceLiftsConfidenceAboveTheUnverifiedCap(t *testing.T) {
+	// This is the evidence-first rule made observable: the same finding from the
+	// same authoritative source is capped at 0.5 without a retrievable artifact and
+	// scores far above it with one.
+	withEvidence := &evidenceModule{manifest: evidenceManifest("evidenced"), keep: true}
+	withoutEvidence := &evidenceModule{manifest: evidenceManifest("unevidenced"), keep: false}
+
+	score := func(m *evidenceModule) (float64, []store.Evidence) {
+		o, st, _ := newHarness(t, m)
+		if _, err := o.Run(context.Background(), sdk.NewEntity(sdk.TypeDomain, "example.com"), []sdk.Module{m}); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		drain(o)
+		ip := sdk.NewEntity(sdk.TypeIP, "203.0.113.10")
+		got, err := st.GetEntity(context.Background(), ip.ID)
+		if err != nil {
+			t.Fatalf("entity not stored: %v", err)
+		}
+		recs, err := st.EvidenceForCase(context.Background(), testCaseID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Confidence, recs
+	}
+
+	capped, cappedEv := score(withoutEvidence)
+	if len(cappedEv) != 0 {
+		t.Errorf("expected no evidence records, got %d", len(cappedEv))
+	}
+	if capped > 0.5 {
+		t.Errorf("unverified confidence %.4f exceeds the 0.5 cap; the evidence-first rule is not being applied", capped)
+	}
+
+	verified, verifiedEv := score(withEvidence)
+	if len(verifiedEv) != 1 {
+		t.Fatalf("expected 1 evidence record, got %d", len(verifiedEv))
+	}
+	if verified <= 0.5 {
+		t.Errorf("confidence %.4f is still capped despite a retained artifact", verified)
+	}
+	// An authoritative, corroborated source is the top of the Admiralty scale, so it
+	// should land near the maximum rather than merely above the cap.
+	if verified < 0.9 {
+		t.Errorf("confidence %.4f is too low for A/1 evidence with an artifact", verified)
+	}
+}
+
+func TestEvidenceRecordIsLinkedToTheObservation(t *testing.T) {
+	m := &evidenceModule{manifest: evidenceManifest("linked"), keep: true}
+	o, st, _ := newHarness(t, m)
+	if _, err := o.Run(context.Background(), sdk.NewEntity(sdk.TypeDomain, "example.com"), []sdk.Module{m}); err != nil {
+		t.Fatal(err)
+	}
+	drain(o)
+
+	ip := sdk.NewEntity(sdk.TypeIP, "203.0.113.10")
+	obs, err := st.Observations(context.Background(), ip.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 {
+		t.Fatalf("observations = %d, want 1", len(obs))
+	}
+	if len(obs[0].Evidence) == 0 {
+		t.Fatal("the observation carries no evidence reference, so a reviewer cannot reach the artifact")
 	}
 }
