@@ -1,0 +1,162 @@
+# Argus configuration example.
+#
+# Precedence, lowest to highest:
+#   built-in defaults < this file < profile < ARGUS_* env < command-line flags
+#
+# Validate before trusting:  argus config validate
+# Inspect the merged result: argus config show --resolved
+version: 1
+
+general:
+  workspace: ~/.argus
+  profile: default          # default | stealth | fast | thorough | monitor
+  mode: passive             # passive | standard (adds semi-active) | active
+  locale: en                # en | id
+  telemetry_optout: true    # Argus never phones home; key kept for explicitness
+
+engine:
+  workers: 32
+  # Bulkheads: one noisy collector must not starve the others.
+  per_module_concurrency:
+    default: 8
+    username-check: 16
+    screenshot: 2
+  max_depth: 2
+  max_breadth_per_entity: 50
+  queue_size: 20000
+  task_timeout: 45s
+  scan_timeout: 2h
+  drain_timeout: 20s
+  checkpoint_interval: 15s
+  budgets:
+    max_entities: 50000
+    max_requests: 250000
+    max_cost_usd: 5.00
+    max_runtime: 2h
+
+network:
+  # Honest identification. ADR-010: Argus never rotates or spoofs its user agent,
+  # because a tool that hides itself cannot be attributed by the party scanned.
+  user_agent: "Argus/dev (+https://github.com/WildanDeveloper/argus)"
+  honest_ua: true
+  http:
+    max_body_bytes: 8MiB
+    max_redirects: 5
+    tls_min_version: "1.2"
+  dns:
+    transport: doh
+    consensus: 2             # require N resolvers to agree before trusting an answer
+    timeout: 3s
+  egress:
+    block_private: true      # SSRF guard: loopback, private, CGNAT, and the cloud
+                             # metadata endpoint are refused at dial time.
+    allow_private_cidrs: []  # only for an authorized internal assessment
+  retry:
+    max_attempts: 3
+    backoff: decorrelated_jitter
+    base: 500ms
+    max: 30s
+  circuit_breaker:
+    failure_threshold: 5
+    window: 60s
+    cooldown: 60s
+
+ratelimit:
+  default: 5/s
+  burst: 10
+  per_host:
+    cloudflare-dns.com: 1/s
+    dns.google: 1/s
+    crt.sh: 1/s
+  shared_backend: none       # none | redis (share limits across workers)
+
+cache:
+  enabled: true
+  ttl:
+    default: 24h
+    dns: 5m
+
+storage:
+  primary:
+    driver: sqlite           # sqlite | postgres
+  graph:
+    driver: memory           # memory | neo4j
+  blobs:
+    driver: fs               # fs | s3
+  retention:
+    raw_evidence: 365d
+    observations: 730d
+    audit: 2555d              # roughly 7 years
+
+queue:
+  driver: memory             # memory | redis | nats | postgres
+
+secrets:
+  driver: env                # env | file | keyring | vault | aws | gcp | azure | sops
+
+modules:
+  enabled: ["*"]
+  # Active-mode modules are off by default: they contact target infrastructure in
+  # ways that may be unwelcome, and each needs written permission.
+  disabled: [axfr-check, nsec-walk, port-probe, trace-path, storage-exposure, firebase-exposure]
+
+policy:
+  file: ~/.config/argus/policy.yaml
+  require_case_for_sensitive: true
+  require_purpose_for_sensitive: true
+
+scope:
+  file: ~/.config/argus/scope.yaml
+  enforce: true
+
+privacy:
+  classify_pii: true
+  redact_exports_by_default: true
+  field_encryption: true
+  erasure_tool: true
+
+evidence:
+  capture: [headers, body]
+  hash: sha256
+  chain: true                # hash-chained, tamper-evident record
+  signing: { driver: ed25519 }
+
+scoring:
+  # Sources that resell the same underlying dataset are counted once, so three
+  # passive-DNS resellers showing one record is one piece of evidence, not three.
+  independence_groups:
+    passive_dns: [securitytrails, virustotal, circl, dnsdb, otx]
+    ct_logs: [crtsh, certspotter, censys-certs]
+    geolocation: [maxmind, ipinfo, ipapi, dbip]
+  decay_half_life: 720h
+  conflict_penalty: 0.25
+
+resolution:
+  auto_merge_threshold: 0.92
+  review_threshold: 0.70
+
+reporting:
+  default_formats: [html, json]
+  default_profile: internal   # internal | client | public
+
+observability:
+  logs: { level: info, format: json }
+
+llm:
+  enabled: false              # off by default
+  require_citations: true     # every sentence must cite evidence
+  redact_before_send: true
+
+profiles:
+  stealth:
+    engine: { workers: 4 }
+    ratelimit: { default: 1/s }
+    general: { mode: passive }
+  fast:
+    engine: { workers: 128, max_depth: 2 }
+  thorough:
+    engine: { max_depth: 5, max_breadth_per_entity: 200 }
+    general: { mode: standard }
+  monitor:
+    engine: { max_depth: 2 }
+    cache: { ttl: { default: 1h } }

@@ -1,0 +1,9 @@
+/bin/
+/dist/
+.argus/
+*.argusbundle
+*.db
+*.db-wal
+*.db-shm
+/data/offline/
+.env

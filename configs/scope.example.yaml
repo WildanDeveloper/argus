@@ -1,0 +1,42 @@
+# Scope-as-code. Every packet is checked against this file before it leaves the
+# machine. A violation fails closed and is written to the audit log.
+#
+# Generate one with:  argus scope init --engagement ID --domain example.com \
+#                       --authorized-by "Name, Role" --valid-days 30
+version: 1
+
+authorization:
+  engagement_id: ACME-2026-01
+  authorized_by: "Jane Doe, CISO, ACME Corp"
+  contact: security@acme.example
+  valid_from: 2026-10-01T00:00:00Z
+  valid_until: 2026-10-31T23:59:59Z
+
+  # Passive reads third-party datasets and needs no engagement record.
+  # Semi-active and active contact the target, so they require written permission.
+  # Add `active` only with permission that says so explicitly.
+  allowed_modes: [passive, semi-active]
+
+allow:
+  # "*.acme.example" means any subdomain and deliberately does NOT match the apex,
+  # so list the apex separately when the engagement covers it.
+  domains: [acme.example, "*.acme.example", acme-cdn.example]
+  cidrs: [203.0.113.0/24, 2001:db8:100::/48]
+  asns: [AS64500]
+  # A rule for a domain is not permission to crawl every path on it.
+  url_prefixes: ["https://portal.acme.example/public/"]
+  orgs: ["ACME Corp"]
+  email_domains: [acme.example]
+
+# Deny always beats allow, so a specific denial carves an exception out of a
+# broad grant.
+deny:
+  domains: ["*.gov", "*.mil", "partner-portal.acme.example"]
+  cidrs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]
+  regex: ['^hr\..*\.acme\.example$']
+
+third_party_data:
+  # Passive data about in-scope assets from third-party sources is always allowed.
+  # Assets discovered outside `allow` are recorded as out_of_scope and never
+  # contacted.
+  record_out_of_scope: true

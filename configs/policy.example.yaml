@@ -1,0 +1,28 @@
+# Purpose limitation, approval, and retention rules.
+version: 1
+
+sensitivity:
+  high:                       # modules marked with the walking-person symbol
+    require: [case, purpose]
+    approval:
+      required: true          # four-eyes: the requester cannot approve their own run
+      approvers: [lead, admin]
+      expires_after: 72h
+    retention: 90d
+    export: redacted_only
+  medium:
+    require: [case]
+  low: {}                     # passive public-data collection is not gated
+
+transport:
+  min_delay: 24h              # aviation and maritime data is public but sensitive
+
+deny_modules: []              # hard bans for your organization
+
+allowed_purposes:
+  - "Authorized attack-surface assessment"
+  - "Brand protection"
+  - "Due diligence (consented or public-interest)"
+  - "Incident response"
+  - "Journalism and public-interest research"
+  - "Academic research under ethics approval"
