@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -116,6 +117,7 @@ func runScope(args []string, stdout, stderr io.Writer) (int, error) {
 type scopeInitFlags struct {
 	engagement string
 	domain     string
+	cidr       string
 	authorized string
 	contact    string
 	validDays  int
@@ -130,6 +132,7 @@ func scopeInit(args []string, stdout, stderr io.Writer) (int, error) {
 	var f scopeInitFlags
 	fs.StringVar(&f.engagement, "engagement", "", "engagement identifier")
 	fs.StringVar(&f.domain, "domain", "", "in-scope domain (repeatable via comma list)")
+	fs.StringVar(&f.cidr, "cidr", "", "in-scope IP prefix (repeatable via comma list)")
 	fs.StringVar(&f.authorized, "authorized-by", "", "who authorized this engagement")
 	fs.StringVar(&f.contact, "contact", "", "security contact for the engagement")
 	fs.IntVar(&f.validDays, "valid-days", 30, "authorization validity in days")
@@ -141,8 +144,11 @@ func scopeInit(args []string, stdout, stderr io.Writer) (int, error) {
 	if f.engagement == "" {
 		return engine.ExitUsage, fmt.Errorf("--engagement is required")
 	}
-	if f.domain == "" {
-		return engine.ExitUsage, fmt.Errorf("--domain is required")
+	if f.domain == "" && f.cidr == "" {
+		// Either kind of asset is enough to state an engagement, and an IP-only
+		// assessment is a real one. Requiring --domain would make those engagements
+		// inexpressible, which is why the scope model carries allow.cidrs at all.
+		return engine.ExitUsage, fmt.Errorf("--domain or --cidr is required")
 	}
 	if f.authorized == "" {
 		// Written authorization is not optional. A scope file with an empty
@@ -183,6 +189,7 @@ func scopeInit(args []string, stdout, stderr io.Writer) (int, error) {
 	// writing only "*.example.com" would exclude example.com itself; emitting both
 	// is what makes `--domain example.com` mean what an operator expects.
 	sc.Allow.Domains = apexAndSubdomains(splitNonEmpty(f.domain))
+	sc.Allow.CIDRs = normalizeCIDRs(splitNonEmpty(f.cidr))
 	sc.Deny.Domains = []string{"*.gov", "*.mil"}
 	sc.Deny.CIDRs = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"}
 	sc.ThirdPartyData.RecordOutOfScope = true
@@ -198,9 +205,51 @@ func scopeInit(args []string, stdout, stderr io.Writer) (int, error) {
 	fmt.Fprintf(stdout, "  engagement  %s\n", sc.Authorization.EngagementID)
 	fmt.Fprintf(stdout, "  authorized  %s\n", sc.Authorization.AuthorizedBy)
 	fmt.Fprintf(stdout, "  valid until %s\n", sc.Authorization.ValidUntil.Format(time.RFC3339))
-	fmt.Fprintf(stdout, "  domains     %s\n", strings.Join(sc.Allow.Domains, ", "))
+	if len(sc.Allow.Domains) > 0 {
+		fmt.Fprintf(stdout, "  domains     %s\n", strings.Join(sc.Allow.Domains, ", "))
+	}
+	if len(sc.Allow.CIDRs) > 0 {
+		fmt.Fprintf(stdout, "  prefixes    %s\n", strings.Join(sc.Allow.CIDRs, ", "))
+	}
 	fmt.Fprintf(stdout, "\nvalidate it with: argus scope validate\n")
 	return engine.ExitOK, nil
+}
+
+// normalizeCIDRs validates and masks each requested prefix.
+//
+// A bare address is accepted and widened to a single-address prefix, because writing
+// 8.8.8.8 into a prefix field is the obvious thing for an operator to do and it
+// should not silently scope nothing. Host bits are cleared so a scope file cannot
+// read as wider than it is: 8.8.8.8/24 is stored as 8.8.8.0/24, which is what the
+// guard will actually enforce.
+func normalizeCIDRs(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range in {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+
+		if !strings.Contains(raw, "/") {
+			addr, err := netip.ParseAddr(raw)
+			if err != nil {
+				// Not a usable prefix and not an address. Emitting it would produce a
+				// scope file that fails validation later, away from the command that
+				// caused it.
+				continue
+			}
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()).String())
+			continue
+		}
+		p, err := netip.ParsePrefix(raw)
+		if err != nil {
+			continue
+		}
+		out = append(out, p.Masked().String())
+	}
+	return out
 }
 
 // apexAndSubdomains expands each domain into its apex plus a subdomain wildcard,
