@@ -16,8 +16,12 @@ const cymruRecord = "15169 | 8.8.8.0/24 | US | arin | 2023-12-28"
 const cymruRecordCloudflare = "13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11"
 
 // Real RIPEstat as-overview payload.
+// Byte-faithful to stat.ripe.net: the success label is "ok", not "success", and
+// there is also a numeric status_code. My first fixture said "success", which the
+// API has never returned, so every lookup failed against a working endpoint.
 const ripeOverview = `{
-  "status": "success",
+  "status": "ok",
+  "status_code": 200,
   "data": {
     "type": "as",
     "resource": "15169",
@@ -320,7 +324,7 @@ func TestEmptyHolderIsAWarningNotAnOrganization(t *testing.T) {
 	m := New(WithBases("origin.asn.cymru.test", "https://ripe.test/data"))
 	h := sdktest.NewHarness(t, m)
 	h.HTTP.Respond("ripe.test", http.StatusOK,
-		`{"status":"success","data":{"resource":"64496","holder":"","announced":false}}`, "application/json")
+		`{"status":"ok","status_code":200,"data":{"resource":"64496","holder":"","announced":false}}`, "application/json")
 
 	h.Run(sdk.NewEntity(sdk.TypeASN, "AS64496"))
 
@@ -406,4 +410,61 @@ func containsStr(list []string, v string) bool {
 		}
 	}
 	return false
+}
+
+func TestDNSAnswerIsRetainedAsEvidence(t *testing.T) {
+	// A route claim with no retrievable artifact is capped at half confidence by the
+	// evidence-first rule. The raw DNS answer is also the only way to re-check how a
+	// record was parsed.
+	h := newHarness(t, cymruRecord, ripeOverview)
+	h.Run(sdk.NewEntity(sdk.TypeIP, "8.8.8.8"))
+
+	if h.Blobs.Count() == 0 {
+		t.Fatal("no evidence retained for the route answer")
+	}
+	body := string(h.Blobs.Bytes())
+	if !strings.Contains(body, cymruRecord) {
+		t.Errorf("retained artifact does not contain the record it is meant to preserve: %s", body)
+	}
+	if !strings.Contains(body, "origin.asn.cymru.test") {
+		t.Errorf("retained artifact does not name the question asked: %s", body)
+	}
+}
+
+func TestRipeSuccessLabelIsOK(t *testing.T) {
+	// stat.ripe.net reports success as "ok". A check for "success" fails every lookup
+	// against a working endpoint while looking like a service problem.
+	for _, status := range []string{`"ok"`, `"success"`} {
+		m := New(WithBases("origin.asn.cymru.test", "https://ripe.test/data"))
+		h := sdktest.NewHarness(t, m)
+		h.HTTP.Respond("ripe.test", http.StatusOK,
+			`{"status":`+status+`,"status_code":200,"data":{"resource":"15169","holder":"GOOGLE"}}`, "application/json")
+
+		h.Run(sdk.NewEntity(sdk.TypeASN, "AS15169"))
+		h.AssertEntities(sdk.TypeOrg, "GOOGLE")
+	}
+}
+
+func TestRipeNumericStatusCodeIsChecked(t *testing.T) {
+	// "status" is a short label that has changed spelling across API versions; the
+	// numeric code has not, so a mismatch in either is a failure.
+	m := New(WithBases("origin.asn.cymru.test", "https://ripe.test/data"))
+	h := sdktest.NewHarness(t, m)
+	h.HTTP.Respond("ripe.test", http.StatusOK,
+		`{"status":"ok","status_code":404,"data":{"resource":"15169","holder":"GOOGLE"}}`, "application/json")
+
+	if err := h.RunExpectingError(sdk.NewEntity(sdk.TypeASN, "AS15169")); err == nil {
+		t.Error("a failing status_code with an ok label must not be accepted")
+	}
+}
+
+func TestResolversAreDeclared(t *testing.T) {
+	// The DNS lookup goes out over DoH to a configured resolver, so a module that
+	// resolves without naming those hosts reaches hosts it never declared.
+	man := New().Manifest()
+	for _, want := range []string{"stat.ripe.net", "dns.google", "cloudflare-dns.com"} {
+		if !containsStr(man.EgressHosts, want) {
+			t.Errorf("EgressHosts = %v, missing %q", man.EgressHosts, want)
+		}
+	}
 }

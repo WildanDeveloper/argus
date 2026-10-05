@@ -101,7 +101,16 @@ func (m *Module) Manifest() sdk.Manifest {
 		Produces:    []sdk.EntityType{sdk.TypeASN, sdk.TypeCIDR, sdk.TypeOrg, sdk.TypeFinding},
 		Mode:        sdk.ModePassive,
 		Sensitivity: sdk.SensLow,
-		EgressHosts: []string{"stat.ripe.net"},
+		// The resolvers are declared because the DNS lookup goes out over DoH to one
+		// of them, and a module that resolves without saying where reaches hosts it
+		// never declared. Same list dns-records carries; the resolver is a
+		// configuration choice, and a module cannot make one on its own.
+		EgressHosts: []string{
+			"stat.ripe.net",
+			"cloudflare-dns.com",
+			"dns.google",
+			"dns.adguard-dns.com",
+		},
 		RateHints: map[string]sdk.Rate{
 			"stat.ripe.net": {Requests: 2, Per: time.Second, Burst: 5},
 		},
@@ -161,7 +170,7 @@ func (m *Module) runIP(ctx context.Context, t sdk.Task, e sdk.Emitter, value str
 		return nil
 	}
 
-	o, found, err := m.cymruOrigin(ctx, addr)
+	o, found, err := m.cymruOrigin(ctx, e, addr)
 	if err != nil {
 		return err
 	}
@@ -263,7 +272,11 @@ func (m *Module) lookupHolder(ctx context.Context, e sdk.Emitter, asnEnt sdk.Ent
 
 	var resp struct {
 		Status string `json:"status"`
-		Data   struct {
+		// status_code is RIPEstat's own HTTP-equivalent code. It is checked too
+		// because "status" is a short label that has changed spelling across API
+		// versions, while the numeric code has not.
+		StatusCode int `json:"status_code"`
+		Data       struct {
 			Resource  string `json:"resource"`
 			Holder    string `json:"holder"`
 			Announced *bool  `json:"announced"`
@@ -277,8 +290,22 @@ func (m *Module) lookupHolder(ctx context.Context, e sdk.Emitter, asnEnt sdk.Ent
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return fmt.Errorf("asn-lookup: parse RIPEstat response: %w", err)
 	}
-	if resp.Status != "" && resp.Status != "success" {
+	// RIPEstat reports success as status "ok". An earlier version of this check
+	// accepted "success", which the API has never returned: every lookup failed while
+	// the endpoint was plainly working, and the failure looked like a service
+	// problem rather than a wrong constant.
+	switch resp.Status {
+	case "ok", "success":
+		// Both spellings accepted so a future relabelling does not break the module.
+	case "":
+		if resp.StatusCode != 0 && resp.StatusCode != 200 {
+			return fmt.Errorf("asn-lookup: RIPEstat returned status_code %d for AS%s", resp.StatusCode, num)
+		}
+	default:
 		return fmt.Errorf("asn-lookup: RIPEstat returned status %q for AS%s", resp.Status, num)
+	}
+	if resp.StatusCode != 0 && resp.StatusCode != 200 {
+		return fmt.Errorf("asn-lookup: RIPEstat returned status_code %d for AS%s", resp.StatusCode, num)
 	}
 
 	holder := strings.TrimSpace(resp.Data.Holder)
@@ -332,7 +359,7 @@ func (m *Module) lookupHolder(ctx context.Context, e sdk.Emitter, asnEnt sdk.Ent
 // A missing record is reported as missing rather than as an error. NXDOMAIN from
 // this database means "not in our tables", which is a much weaker statement than "no
 // such network exists".
-func (m *Module) cymruOrigin(ctx context.Context, addr string) (origin, bool, error) {
+func (m *Module) cymruOrigin(ctx context.Context, e sdk.Emitter, addr string) (origin, bool, error) {
 	// The reversed address is the leftmost label; the service suffix follows it.
 	name := reversedIP(addr) + "." + m.cymruBase
 	records, err := m.dns.Lookup(ctx, name, "TXT")
@@ -342,10 +369,36 @@ func (m *Module) cymruOrigin(ctx context.Context, addr string) (origin, bool, er
 	}
 	for _, r := range records {
 		if o, ok := parseCymru(r.Data); ok {
+			// Retain the answer. A route claim with no retrievable artifact is capped
+			// at half confidence by the evidence-first rule, which is correct but also
+			// means the raw record is the only way to re-check the parsing.
+			if err := retainDNSAnswer(ctx, e, name, r); err != nil {
+				e.Warn("evidence capture failed", "name", name, "err", err.Error())
+			}
 			return o, true, nil
 		}
 	}
 	return origin{}, false, nil
+}
+
+// retainDNSAnswer stores the DNS answer that a routing claim is based on.
+func retainDNSAnswer(ctx context.Context, e sdk.Emitter, name string, r sdk.DNSRecord) error {
+	payload := map[string]any{
+		"question": name,
+		"type":     r.Type,
+		"answer":   r.Data,
+		"ttl":      r.TTL,
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = e.PutEvidence(ctx, sdk.EvidenceMeta{
+		Source:    "dns:" + name,
+		Method:    "dns.lookup",
+		MediaType: "application/json",
+	}, raw)
+	return err
 }
 
 // parseCymru decodes a Cymru origin TXT record.
