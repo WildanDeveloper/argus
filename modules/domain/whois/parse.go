@@ -249,8 +249,11 @@ func parseRecord(text string) *record {
 			}
 		case "email":
 			addr := extractEmail(value)
-			if addr == "" || isRedacted(addr) {
-				if isRedacted(value) {
+			if addr == "" {
+				// Anything the extractor would not hand back whole is recorded as
+				// withheld. It is the registry's statement either way, and guessing at
+				// the unmasked value would fabricate a contact.
+				if isRedacted(value) || looksMasked(value) {
 					r.redacted = appendUnique(r.redacted, normalizeKey(key))
 				}
 				continue
@@ -299,11 +302,65 @@ func cleanValue(v string) string {
 
 var emailPattern = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 
+// maskRuns are the placeholder characters privacy services substitute for the real
+// local part or domain label.
+const maskChars = "*xX"
+
+// extractEmail pulls an address out of a field value, and refuses anything that is
+// masked.
+//
+// The refusal matters more than the extraction. Privacy services publish forms like
+// "a***b@example.com" and "XXXXX@privacy.xxxx.xxx", and a regex happily matches inside
+// them: the first yields "b@example.com", which is not masked at all, is a different
+// mailbox than any that exists, and would enter the graph looking like a verified
+// contact. So an address is emitted only when it is byte-identical to the field, and
+// anything that had to be trimmed or patched to produce a match is treated as withheld.
 func extractEmail(v string) string {
-	if m := emailPattern.FindString(v); m != "" {
-		return strings.ToLower(m)
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" || looksMasked(trimmed) {
+		return ""
 	}
-	return ""
+	// The match must span the whole value. A partial match means the field held
+	// something other than a bare address, and the remainder is decoration, a mask, or
+	// a second address.
+	m := emailPattern.FindString(trimmed)
+	if m == "" || !strings.EqualFold(m, trimmed) {
+		return ""
+	}
+	if strings.ContainsAny(trimmed, " \t,;<>") {
+		return ""
+	}
+	return strings.ToLower(m)
+}
+
+// looksMasked reports whether a value has been obscured.
+func looksMasked(v string) bool {
+	lower := strings.ToLower(v)
+	for _, marker := range []string{"privacy", "redacted", "notdisclosed", "not-disclosed",
+		"disclosure", "withheld", "anonymized", "anonymised", "shielded", "obscured"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	// A run of three or more identical mask characters is a placeholder, whether it
+	// stands in for the local part or for a domain label.
+	for _, part := range strings.FieldsFunc(lower, func(r rune) bool {
+		return r == '.' || r == '@'
+	}) {
+		if len(part) >= 3 {
+			same := 0
+			for i := 0; i < len(part); i++ {
+				if !strings.ContainsRune(maskChars, rune(part[i])) {
+					break
+				}
+				same++
+			}
+			if same >= 3 {
+				return true
+			}
+		}
+	}
+	return strings.Contains(v, "*")
 }
 
 // splitList breaks a value that may hold several entries on one line.
