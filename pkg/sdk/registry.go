@@ -93,8 +93,16 @@ func ValidateManifest(m Manifest) []string {
 	if len(m.Consumes) == 0 {
 		problems = append(problems, "declares no Consumes; it will never be scheduled")
 	}
-	if len(m.EgressHosts) == 0 {
-		problems = append(problems, "empty EgressHosts: only valid for a module that reads local files")
+	if len(m.EgressHosts) == 0 && !m.ReadsLocalFiles {
+		// An empty allow-list would otherwise be a module that can reach anything, or
+		// one that reaches nothing and says so ambiguously. The one case where it is
+		// honest is a module that reads local files, and it has to say so.
+		problems = append(problems, "empty EgressHosts without ReadsLocalFiles: a module either reaches hosts it declares or reads local files")
+	}
+	if m.ReadsLocalFiles && len(m.EgressHosts) > 0 {
+		// The opposite is just as wrong: a module that declares it makes no request
+		// should not be permitted to make one.
+		problems = append(problems, "ReadsLocalFiles with EgressHosts declared: a module that reads local files must make no requests")
 	}
 	for _, h := range m.EgressHosts {
 		if h == "" || strings.ContainsAny(h, " /") {

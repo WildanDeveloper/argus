@@ -44,6 +44,12 @@ type Manifest struct {
 	// EgressHosts is the enforced allow-list for this module. A module may reach a
 	// host only if it appears here or was granted from a bootstrap document.
 	EgressHosts []string
+	// ReadsLocalFiles declares that this module reads files from disk and makes no
+	// network request at all. It exists so an empty EgressHosts can be legitimate
+	// rather than merely unexplained: without it, a metadata reader either lies about
+	// hosts it never contacts or is reported as broken.
+	ReadsLocalFiles bool
+
 	// BootstrapHosts names URLs the broker may fetch in order to authorize further
 	// hosts. A module that must discover its endpoints cannot enumerate them in a
 	// static list without going stale, and simply trusting it to reach whatever it
@@ -245,6 +251,19 @@ type Task struct {
 	Params   map[string]string
 	Deadline time.Time
 }
+
+// ParamFilePath names the task parameter carrying the filesystem path of a local file
+// target.
+//
+// It exists because a file entity is content-addressed: the SDK's canonical identity
+// for a file is the SHA-256 of its bytes, which is correct for deduplication and
+// useless for opening the file. A metadata collector therefore cannot learn where to
+// read from the target alone, and without a documented channel for it there is no way
+// to write a local-file module at all.
+//
+// The path is a locator, not an identity. Two names for the same content are the same
+// entity, and either path may be used to read it.
+const ParamFilePath = "file.path"
 
 // Param returns a task parameter, or def when absent.
 func (t Task) Param(key, def string) string {

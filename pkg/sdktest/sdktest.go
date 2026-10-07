@@ -503,8 +503,35 @@ func (h *Harness) Run(targets ...sdk.Entity) []sdk.Finding {
 // RunExpectingError executes the module and requires an error.
 func (h *Harness) RunExpectingError(target sdk.Entity) error {
 	h.T.Helper()
-	task := sdk.Task{Target: target, Params: map[string]string{}, Deadline: h.Clock.Now().Add(time.Minute)}
+	return h.RunTaskExpectingError(sdk.Task{Target: target})
+}
+
+// RunTask executes the module against a fully specified task.
+//
+// A module may need more than an entity: a local file's path travels as a task
+// parameter because the entity itself is content-addressed. Building a task by hand is
+// the only way to exercise that, so it is available rather than worked around.
+func (h *Harness) RunTask(task sdk.Task) error {
+	h.T.Helper()
+	if task.ScanID == "" {
+		task.ScanID = "test-scan"
+	}
+	if task.CaseID == "" {
+		task.CaseID = "test-case"
+	}
+	if task.Params == nil {
+		task.Params = map[string]string{}
+	}
+	if task.Deadline.IsZero() {
+		task.Deadline = h.Clock.Now().Add(time.Minute)
+	}
 	return h.Module.Run(context.Background(), task, h.Out)
+}
+
+// RunTaskExpectingError executes a task and requires an error.
+func (h *Harness) RunTaskExpectingError(task sdk.Task) error {
+	h.T.Helper()
+	return h.RunTask(task)
 }
 
 // AssertEntities requires findings producing entities of type with the given

@@ -10,6 +10,7 @@ import (
 	_ "github.com/WildanDeveloper/argus/modules/domain/reverse"
 	_ "github.com/WildanDeveloper/argus/modules/domain/wayback"
 	_ "github.com/WildanDeveloper/argus/modules/domain/whois"
+	_ "github.com/WildanDeveloper/argus/modules/media/exif"
 	_ "github.com/WildanDeveloper/argus/modules/network/asnlookup"
 	_ "github.com/WildanDeveloper/argus/modules/network/ipgeo"
 )

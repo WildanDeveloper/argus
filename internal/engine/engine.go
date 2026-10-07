@@ -5,9 +5,14 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,16 +44,19 @@ var ErrBudgetExhausted = errors.New("engine: budget exhausted")
 
 // Options configure a run.
 type Options struct {
-	ScanID       string
-	CaseID       string
-	Purpose      string
-	Actor        string
-	Mode         sdk.Mode
-	AllowActive  bool
-	Workers      int
-	MaxDepth     int
-	MaxBreadth   int
-	TaskTimeout  time.Duration
+	ScanID      string
+	CaseID      string
+	Purpose     string
+	Actor       string
+	Mode        sdk.Mode
+	AllowActive bool
+	Workers     int
+	MaxDepth    int
+	MaxBreadth  int
+	TaskTimeout time.Duration
+	// FilePath is where a local file target lives, for modules that must open it. The
+	// entity itself is content-addressed and cannot carry this.
+	FilePath     string
 	ScanTimeout  time.Duration
 	DrainTimeout time.Duration
 	Budgets      Budgets
@@ -482,7 +490,7 @@ func (o *Orchestrator) run(ctx context.Context, target sdk.Entity, modules []sdk
 			continue
 		}
 		sched.enqueue(man.Name, sdk.Task{ScanID: scanID, CaseID: o.opts.CaseID, Target: target,
-			Depth: 0, Deadline: o.now().Add(o.opts.ScanTimeout)}, o.log)
+			Depth: 0, Deadline: o.now().Add(o.opts.ScanTimeout), Params: o.rootParams(target)}, o.log)
 	}
 
 	// Wait for the graph to drain. A cancelled or timed-out scan short-circuits the
@@ -687,6 +695,21 @@ func (o *Orchestrator) release(module string) {
 	}
 }
 
+// rootParams supplies task parameters that only apply to the operator-supplied root.
+//
+// A local file target is the case that needs one: the entity is content-addressed, so
+// the path it was named by travels beside it rather than inside it.
+func (o *Orchestrator) rootParams(target sdk.Entity) map[string]string {
+	if o.opts.FilePath == "" {
+		return nil
+	}
+	switch target.Type {
+	case sdk.TypeFile, sdk.TypeImage:
+		return map[string]string{sdk.ParamFilePath: o.opts.FilePath}
+	}
+	return nil
+}
+
 func (o *Orchestrator) markSeen(e sdk.Entity) bool {
 	o.seenMu.Lock()
 	defer o.seenMu.Unlock()
@@ -730,6 +753,51 @@ func (o *Orchestrator) auditScope(ctx context.Context, target sdk.Entity, d poli
 }
 
 // resolveTarget infers the entity type of a user-supplied string.
+// FileEntity builds a content-addressed entity for a local file.
+//
+// The identity is the digest of the bytes rather than the path, which is what makes two
+// names for one file the same entity in the graph. The path a module needs in order to
+// open it travels separately, as a task parameter.
+func FileEntity(path string) sdk.Entity {
+	sum, err := hashFile(path)
+	if err != nil {
+		return sdk.Entity{}
+	}
+	return sdk.NewEntity(sdk.TypeFile, sum)
+}
+
+// hashFile digests a file without loading it, so a large photo costs no memory.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ExistingFile reports whether a target names a readable regular file. The CLI uses it
+// to decide whether to attach the path to a task.
+func ExistingFile(s string) (string, bool) { return existingFile(s) }
+
+// existingFile reports whether a target names a readable regular file.
+func existingFile(s string) (string, bool) {
+	if s == "" || len(s) > 4096 || strings.ContainsAny(s, "\n\x00") {
+		return "", false
+	}
+	info, err := os.Stat(s)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	// A target that exists is still subject to the caller's scope check; this only
+	// decides what kind of entity it is.
+	return s, true
+}
+
 func ResolveTarget(s string) (sdk.Entity, error) {
 	s = trimSpace(s)
 	if s == "" {
@@ -756,6 +824,13 @@ func ResolveTarget(s string) (sdk.Entity, error) {
 	if v, err := sdk.Canonicalize(sdk.TypePhone, s); err == nil {
 		return sdk.NewEntity(sdk.TypePhone, v), nil
 	}
+	// A path to a regular file is a local-file target. It is checked before the
+	// host-name branch because a relative path like "./photo" also looks like a dotted
+	// name, and a file the operator named is unambiguously not a domain.
+	if path, ok := existingFile(s); ok {
+		return FileEntity(path), nil
+	}
+
 	// A dotted, non-numeric string with a registrable-looking shape is a host name.
 	// The Public Suffix List decides whether it is the apex (domain) or something
 	// below it (subdomain), because that distinction is what makes subdomain_of a

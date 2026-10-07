@@ -215,6 +215,14 @@ func runScan(args []string, stdout, stderr io.Writer) (int, error) {
 	// engagement, which keeps one scan's budget and case coherent.
 	root := entities[0]
 
+	// A local file's identity is its content digest, so the path it was named by has to
+	// travel beside it for a module that must open the file.
+	if root.Type == sdk.TypeFile || root.Type == sdk.TypeImage {
+		if _, ok := engine.ExistingFile(targets[0]); ok {
+			opts.FilePath = targets[0]
+		}
+	}
+
 	deps, closeFn, err := buildDeps(cfg, guard, pol, f, g.quiet)
 	if err != nil {
 		return engine.ExitStorage, err
